@@ -43,6 +43,7 @@ tcp_ecu/
     handler.py         # TCP buffering, framing, and dispatch
     server.py          # Server configuration and CLI
   protocol.py          # Command decorators, templates, and dispatcher
+  pages.py             # Byte-preserving codecs for generated page responses
   proxy.py             # ECUProxy base class
   constants.py         # Connection defaults and protocol constants
   utils.py             # Shared INI and framing helpers
@@ -60,6 +61,36 @@ Python imports now use the `tcp_ecu` package. Regenerate previously generated
 proxy modules to update their imports, or update the imports in customized modules
 using the examples below.
 
+## Project Definition
+
+`mainController.ini` is the project-local copy of the original ECU definition,
+converted from Latin-1 to UTF-8. It adds an eight-byte page 8 (wire page `0x0d`)
+with two unsigned 32-bit integers in Hz:
+
+| Page Property | Byte Offset | Output Channel Alias |
+| --- | --- | --- |
+| `output_shaft_pulse_rate` | 0 | `outputShaftPulseRate` |
+| `cruise_control_pulse_rate` | 4 | `cruiseControlPulseRate` |
+
+The aliases expose stored page values, not live pulse measurements. They follow
+TunerStudio's expression-channel syntax and reference its loaded constants;
+the original 212-byte telemetry block is unchanged. See the
+[EFI Analytics INI specification](https://www.efianalytics.com/TunerStudio/docs/EFI%20Analytics%20ECU%20Definition%20files.pdf),
+section 11.1.3.
+
+This defines the new page's protocol but does not implement backing storage.
+The generated proxy forwards its reads, writes, burn, and CRC commands to the
+injected `ECUInterface`. Implement page `0x0d` in the proxy/interface or ECU
+before using this definition with hardware; the original ECU firmware is not
+made aware of it by changing the INI.
+
+Regenerate and validate the project proxy without connecting to hardware:
+
+```sh
+python3 generate_proxy.py mainController.ini --class-name MainControllerProxy --output main_controller_proxy.py
+python3 server.py mainController.ini --proxy-class main_controller_proxy:MainControllerProxy --check
+```
+
 ## Generated Classes
 
 The server generates its proxy class in memory by default. To produce an editable,
@@ -71,12 +102,30 @@ python3 generate_proxy.py /path/to/mainController-tcp.ini \
 python3 server.py /path/to/mainController-tcp.ini --proxy-class ms2_proxy:MS2Proxy
 ```
 
+With `--output`, page response classes are written to a sibling package named
+`<output_stem>_pages`, one class per file. The proxy imports those classes:
+
+```text
+ms2_proxy.py
+ms2_proxy_pages/
+  __init__.py
+  page_1_response.py
+  page_2_response.py
+  ...
+```
+
+Keep the proxy module and its page package together when moving or deploying
+them. Regeneration overwrites the generated files, so preserve any custom edits
+first. In-memory generation and stdout output remain self-contained; neither
+writes a page package to disk.
+
 A generated page-read method has this structure:
 
 ```python
 from typing import Annotated
 from tcp_ecu.protocol import IniParameter, ecu_command
 from tcp_ecu.proxy import ECUProxy
+from ms2_proxy_pages import Page1Response
 
 class MS2Proxy(ECUProxy):
     @ecu_command(r"r\$tsCanId\x04%2o%2c", response_length="c")
@@ -88,10 +137,13 @@ class MS2Proxy(ECUProxy):
         *,
         response_length: int | None,
     ) -> bytes:
-        return self._exchange(
+        data = self._exchange(
             "page_read_command_1", response_length,
             tsCanId=ts_can_id, o=offset, c=count,
         )
+        page = Page1Response.from_bytes(data, offset=offset)
+        # Customize populated page properties here before serialization.
+        return page.to_bytes()
 ```
 
 `MS2Proxy(interface)` inherits the `ECUInterface` constructor from `ECUProxy`.
@@ -109,6 +161,48 @@ also get numbered methods. Each chain component is dispatched separately, as
 TunerStudio sends it. Identical wire templates are aliases; the alphabetically
 first matching method handles them. More specific literal templates take precedence
 over generic templates, and ambiguous non-alias matches are rejected.
+
+## Page Responses
+
+The generator also emits a dataclass for each tuning page, such as
+`Page1Response`, with typed properties named after the INI's constants. Every
+property defaults to `None`. Generated page-read methods decode the ECU's bytes,
+provide a place to customize the page, and serialize it back to bytes. Other
+command responses are unchanged. Classes are also available through
+`Proxy.page_response_types[page_number]` when generating a proxy in memory.
+
+```python
+page = Page1Response.from_bytes(data, offset=requested_offset)
+if page.nCylinders is not None:
+    page.nCylinders = 8
+return page.to_bytes()
+```
+
+`offset` is the zero-based position of the received segment in the page. Only
+fields completely contained in that segment are populated; an array remains
+`None` unless all its elements were received. Unchanged responses round-trip
+byte-for-byte, including padding, unknown bytes, floating-point representations,
+and ECU status. Serialization preserves the original segment length. Start with
+`from_bytes()` rather than a blank instance so those backing bytes are available.
+
+Numeric scalars, bit fields, and fixed one- or two-dimensional arrays honor the
+INI's storage types and byte order. Arrays become lists or row-by-row nested
+lists. Scaled properties use `(raw + translate) * scale`; edited integer-backed
+values are rounded to the nearest representable raw integer and range-checked.
+Only edited properties or array elements are written. Bit-field edits preserve
+neighboring bits, and contradictory edits to overlapping aliases raise an error.
+Aliases are snapshots, not automatically synchronized views. Setting a property
+to `None` leaves its original bytes untouched; editing an unavailable field is
+rejected.
+
+Scale and translation expressions support numeric constants, field references,
+and basic arithmetic. Same-page dependencies resolve automatically when their
+fields were received. Missing dependencies leave the property `None`; supply
+known values from other pages or earlier reads with `context`, for example
+`Page7Response.from_bytes(data, context={"maf_range": 1})`. Generated methods do
+not cache other pages. Strings, variable-length arrays, and more complex
+conversion expressions fail explicitly during generation instead of guessing a
+layout or conversion. ECU configuration-error responses remain opaque.
 
 ## Lengths and Framing
 

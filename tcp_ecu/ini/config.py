@@ -1,12 +1,14 @@
 """Read the command-bearing portion of a TunerStudio ECU definition."""
 
 import ast
+import keyword
 import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 from tcp_ecu.protocol import CommandPattern
+from tcp_ecu.pages import PageField, PageResponse
 from tcp_ecu.utils import decode_ini_string, strip_inline_comment
 
 
@@ -25,19 +27,45 @@ class IniCommand:
     template: str
     response_length: int | str | None
     page_identifier: str | None = None
+    page: int | None = None
+    read_offset: int = 0
+
+
+@dataclass(frozen=True)
+class IniPage:
+    number: int
+    size: int | None
+    fields: tuple[PageField, ...]
 
 
 def split_values(value):
-    """Split INI command lists without interpreting their backslash escapes."""
+    """Split top-level INI attributes, retaining strings and expressions intact."""
     values = []
-    position = 0
-    token = re.compile(r'\s*("(?:\\.|[^"\\])*"|[^,]+?)\s*(?:,|$)')
-    while position < len(value):
-        match = token.match(value, position)
-        if not match:
-            raise ValueError(f"Invalid INI value list: {value!r}")
-        values.append(match[1])
-        position = match.end()
+    start = 0
+    quoted = False
+    escaped = False
+    stack = []
+    closing = {"}": "{", "]": "[", ")": "("}
+    for position, char in enumerate(value):
+        if escaped:
+            escaped = False
+        elif quoted and char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif not quoted:
+            if char in "{[(":
+                stack.append(char)
+            elif char in closing:
+                if not stack or stack.pop() != closing[char]:
+                    raise ValueError(f"Unbalanced INI attribute: {value!r}")
+            elif char == "," and not stack:
+                values.append(value[start:position].strip())
+                start = position + 1
+    if quoted or stack:
+        raise ValueError(f"Unterminated INI attribute: {value!r}")
+    if value[start:].strip():
+        values.append(value[start:].strip())
     return values
 
 
@@ -85,7 +113,9 @@ class IniProtocolConfig:
             raise ValueError(f"Unsupported endianness: {self.byteorder}")
         self.signature = decode_ini_string(self._value("MegaTune", "signature", '""'))
         self.och_block_size = self._integer("OutputChannels", "ochBlockSize")
+        self.parameter_start_offset = self._integer("Constants", "parameterStartOffset", 0)
         self.commands = self._read_commands()
+        self.pages = self._read_pages()
         if not self.commands:
             raise ValueError(f"No commands found in {self.path}")
         query = next((command for command in self.commands if command.name == "query_command"), None)
@@ -230,8 +260,84 @@ class IniProtocolConfig:
             if name in used_names:
                 raise ValueError(f"Conflicting generated method name: {name}")
             used_names.add(name)
-            commands.append(IniCommand(name, template, length, identifier))
+            read_page = page if entry.name == "pageReadCommand" else None
+            read_offset = 0
+            if read_page and "o" not in CommandPattern(template).variables:
+                pattern = CommandPattern(template, self.byteorder)
+                probe = pattern.render({token: 0 for token in pattern.variables})
+                if len(probe) == 7 and probe[:1] == b"r":
+                    read_offset = int.from_bytes(probe[3:5], self.byteorder) - self.parameter_start_offset
+            commands.append(IniCommand(name, template, length, identifier, read_page, read_offset))
         return commands
+
+    def _read_pages(self):
+        pages = {number: [] for number in range(1, self._integer("Constants", "nPages", 0) + 1)}
+        for command in self.commands:
+            if command.page is not None:
+                pages.setdefault(command.page, [])
+        offsets = {}
+        names = {}
+
+        def integer(value):
+            return int(value, 16) if value.lower().startswith("0x") else int(value)
+
+        def conversion(value):
+            if value.startswith("{") and value.endswith("}"):
+                return value[1:-1].strip()
+            return float(value)
+
+        for entry in self.entries:
+            if entry.section != "Constants":
+                continue
+            kind = entry.value.partition(",")[0].strip()
+            if kind not in {"scalar", "array", "bits", "string", "oddArray"}:
+                continue
+            try:
+                if kind not in {"scalar", "array", "bits"}:
+                    raise ValueError(f"Unsupported page field kind {kind!r}")
+                parts = split_values(entry.value)
+                page = entry.page or 1
+                fields = pages.setdefault(page, [])
+                previous, following = offsets.get(page, (0, 0))
+                offset = {"lastOffset": previous, "nextOffset": following}.get(parts[2])
+                if offset is None:
+                    offset = integer(parts[2])
+                name = entry.name + "_" if keyword.iskeyword(entry.name) else entry.name
+                if not name.isidentifier() or name.startswith("_") or hasattr(PageResponse, name):
+                    raise ValueError(f"Unsupported page property name {entry.name!r}")
+                if name in names.setdefault(page, set()):
+                    raise ValueError(f"Duplicate page property {name!r}")
+                names[page].add(name)
+                shape = ()
+                bits = None
+                scale, translate = 1.0, 0.0
+                if kind == "bits":
+                    match = re.fullmatch(r"\[\s*(\d+)\s*:\s*(\d+)\s*\]", parts[3])
+                    if not match:
+                        raise ValueError(f"Unsupported bit shape {parts[3]!r}")
+                    bits = int(match[1]), int(match[2])
+                else:
+                    if kind == "array":
+                        match = re.fullmatch(r"\[\s*(\d+)\s*(?:[xX]\s*(\d+)\s*)?\]", parts[3])
+                        if not match:
+                            raise ValueError(f"Unsupported array shape {parts[3]!r}")
+                        shape = tuple(int(value) for value in match.groups() if value is not None)
+                    index = 5 if kind == "array" else 4
+                    scale, translate = conversion(parts[index]), conversion(parts[index + 1])
+                field = PageField(name, parts[1].upper(), offset, shape, scale, translate, bits, entry.name)
+                fields.append(field)
+                offsets[page] = offset, offset + field.size
+            except (ValueError, IndexError, SyntaxError) as exc:
+                raise ValueError(f"INI line {entry.line}, field {entry.name}: {exc}") from exc
+
+        result = {}
+        for page, fields in sorted(pages.items()):
+            value = self._page_value("pageSize", page)
+            size = integer(value) if value is not None else None
+            if size is not None and (size < 0 or any(field.offset + field.size > size for field in fields)):
+                raise ValueError(f"Invalid layout or pageSize for page {page}")
+            result[page] = IniPage(page, size, tuple(fields))
+        return result
 
     def _response_length(self, entry, pattern, page):
         override = self._value(entry.section, entry.name + "ResponseLength")
